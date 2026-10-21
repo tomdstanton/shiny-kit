@@ -109,7 +109,7 @@ minversion = "8.0"
 testpaths = ["tests"]
 norecursedirs = [".venv", "dist", "build", ".git", ".ruff_cache"]
 # Token-saving flags: suppress header/summary noise, truncate tracebacks, silence passing output
-addopts = "-q --tb=short --show-capture=no --cov=src --cov-report=term-missing --cov-branch --cov-fail-under=85"
+addopts = "-q --tb=short --show-capture=no --cov=src --cov-report=term-missing --cov-branch --cov-fail-under=85 -n auto"
 markers = [
     "max_span_ms(span_name, max_duration_ms): Assert span duration budget.",
 ]
