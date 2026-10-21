@@ -33,14 +33,14 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Build the package
+        run: uv build
+
       - name: Install project and dependencies
         run: uv sync --all-groups
 
       - name: Run test suite
         run: uv run --group test pytest
-
-      - name: Build the package
-        run: uv build
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
