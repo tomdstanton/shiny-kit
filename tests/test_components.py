@@ -13,7 +13,17 @@ from shiny import reactive, render
 from shiny import ui as shiny_ui
 from shiny.types import SilentException
 
-from shiny_kit.component import Component, ParentTab, SubComponentProxy, Tab, subcomponent
+from shiny_kit.component import (
+    BaseHeroTab,
+    Component,
+    HeroConfig,
+    HeroStatSpec,
+    ParentTab,
+    SubComponentProxy,
+    Tab,
+    WorkflowStepSpec,
+    subcomponent,
+)
 from shiny_kit.decorators import (
     BoundTask,
     _wrap_sync_or_async,
@@ -22,10 +32,16 @@ from shiny_kit.decorators import (
     bind_effect,
     bind_output,
     bind_task,
+    bind_widget,
     reactive_calc,
     reactive_prop,
 )
-from shiny_kit.explorers import ArtifactSwitcher, BasePlotterExplorer, TableExplorer
+from shiny_kit.explorers import (
+    ArtifactSwitcher,
+    BasePlotterExplorer,
+    TableExplorer,
+    WidgetPlotterExplorer,
+)
 from shiny_kit.state import BaseSessionState, Requirement, artifact_registry
 
 # ---------------------------------------------------------------------------
@@ -471,11 +487,11 @@ def test_artifact_switcher_table_and_plotter_explorers(tmp_path: Path) -> None:
             texp.serialize_csv(object())
 
         body_populated = str(_DemoTableExplorer.explorer_body_ui.fn(texp))  # ty: ignore[call-non-callable]
-        assert "estimates_datagrid" in body_populated
+        assert "table_datagrid" in body_populated
         assert texp._csv_filename() == "export_polars.csv"
         with patch.object(_DemoTableExplorer, "active_table_df", return_value=df_polars):
             assert list(texp.download_table_csv()) == [b"a,b\n1,2\n"]
-            assert _DemoTableExplorer.estimates_datagrid.fn(texp) is df_polars  # ty: ignore[call-non-callable]
+            assert _DemoTableExplorer.render_table_datagrid.fn(texp) is df_polars  # ty: ignore[call-non-callable]
 
         # 3. BasePlotterExplorer
         pexp = _DemoPlotterExplorer()
@@ -484,7 +500,7 @@ def test_artifact_switcher_table_and_plotter_explorers(tmp_path: Path) -> None:
         assert "Plot Type" in str(_DemoPlotterExplorer.plot_selector_ui.fn(pexp))  # ty: ignore[call-non-callable]
         assert "plot_bar_title" in str(_DemoPlotterExplorer.plot_parameters_ui.fn(pexp))  # ty: ignore[call-non-callable]
         assert str(_DemoPlotterExplorer.extra_controls_ui.fn(pexp)) == "<div></div>"  # ty: ignore[call-non-callable]
-        assert "main_altair_chart" in str(_DemoPlotterExplorer.plot_canvas_ui.fn(pexp))  # ty: ignore[call-non-callable]
+        assert "main_chart" in str(_DemoPlotterExplorer.plot_canvas_ui.fn(pexp))  # ty: ignore[call-non-callable]
 
         state.color_mode = "dark"
         chart = _DemoPlotterExplorer.current_chart.fn(pexp)  # ty: ignore[call-non-callable]
@@ -500,3 +516,141 @@ def test_artifact_switcher_table_and_plotter_explorers(tmp_path: Path) -> None:
         assert str(_DemoPlotterExplorer.plot_parameters_ui.fn(pexp)) == "<div></div>"  # ty: ignore[call-non-callable]
         assert _DemoPlotterExplorer.current_chart.fn(pexp) is None  # ty: ignore[call-non-callable]
         assert "No Active Model to Plot" in str(_DemoPlotterExplorer.plot_canvas_ui.fn(pexp))  # ty: ignore[call-non-callable]
+
+
+class _InlineCardSwitcher(_DemoSwitcher):
+    inline_layout = True
+    card_wrapped = True
+    header_icon = "box"
+
+    def extra_buttons_ui(self, active: _ModelArtifact | None) -> list[TagChild]:
+        return [shiny_ui.span("ExtraBtn")]
+
+
+class _DemoWidgetPlotter(WidgetPlotterExplorer[_ModelArtifact]):
+    chart_output_id: ClassVar[str] = "custom_widget_chart"
+    plotter_registry: ClassVar[dict[str, tuple[str, type[Any]]]] = {
+        "bar": ("Bar Chart", _DummyPlotter),
+    }
+
+    def active_subject(self) -> _ModelArtifact | None:
+        return self.state.artifacts.active
+
+
+class _DemoHeroTab(BaseHeroTab[_AppState]):
+    config = HeroConfig(
+        badge_text="v1.0",
+        headline="Welcome to ShinyKit",
+        subtitle="A modern toolkit.",
+        primary_cta_label="Get Started",
+        secondary_cta_label="Load Demo",
+        preview_title="Live Preview",
+        stats=(HeroStatSpec("10x", "Speed"),),
+        workflow_steps=(
+            WorkflowStepSpec(
+                step_label="Step 1",
+                description="Desc 1",
+                badge="Fast",
+                metrics=("M1",),
+                target_tab="tab1",
+            ),
+        ),
+    )
+
+
+def test_hero_tab_widget_explorer_and_decorators() -> None:
+    with reactive.isolate():
+        state = _AppState()
+        art = _ModelArtifact("hero_art", [1, 2])
+        state.artifacts.register(art)
+
+        # 1. Component.has_changed & sync_version
+        card = _ChildCard()
+        _bind_component_mock(card, state)
+        assert card.has_changed("k", 1) is True
+        assert card.has_changed("k", 1) is False
+        card.sync_version("v", 5)
+        assert card.has_changed("v", 5) is False
+
+        # 2. Inline + card_wrapped ArtifactSwitcher
+        inline_ui = str(_InlineCardSwitcher._render_ui())
+        assert "switcher_body_ui" in inline_ui
+        isw = _InlineCardSwitcher()
+        _bind_component_mock(isw, state)
+        inline_body = str(_InlineCardSwitcher.switcher_body_ui.fn(isw))  # ty: ignore[call-non-callable]
+        assert "ExtraBtn" in inline_body
+        assert "card" in inline_body
+
+        # 3. bind_output resolve_target_id & client_dimensions, bind_widget
+        class _DynamicOutComp(Component[_AppState]):
+            custom_id = "resolved_out_id"
+
+            @classmethod
+            def _render_ui(cls) -> TagChild:
+                return shiny_ui.div()
+
+            @bind_output(render.text, id_attr="custom_id")
+            def dynamic_text(self) -> str:
+                return "ok"
+
+            @bind_widget(id_attr="custom_id", autosize=True)
+            def dynamic_widget(self) -> Any:
+                return {"chart": True}
+
+        doc = _DynamicOutComp()
+        _bind_component_mock(doc, state)
+        doc._session = MagicMock()
+        doc._session.clientdata.output_width.return_value = 640
+        doc._session.clientdata.output_height.return_value = 420
+        out_desc = _DynamicOutComp.__dict__["dynamic_text"]
+        assert out_desc.resolve_target_id(doc) == "resolved_out_id"
+        assert out_desc.client_dimensions(doc) == (640, 420)
+
+        w_desc = _DynamicOutComp.__dict__["dynamic_widget"]
+        assert w_desc.transform(doc, None) is None
+        assert w_desc.transform(doc, {"chart": True}) == {"chart": True}
+
+        mock_fig_fit = MagicMock(spec=["fit_to_container"])
+        mock_fig_fit.fit_to_container.return_value = "fitted_fig"
+        assert w_desc.transform(doc, mock_fig_fit) == "fitted_fig"
+        mock_fig_fit.fit_to_container.assert_called_once_with(width=640, height=420)
+
+        w_desc.resizer = lambda fig, w, h: ("resized", fig, w, h)
+        assert w_desc.transform(doc, "my_fig") == ("resized", "my_fig", 640, 420)
+
+        # 4. WidgetPlotterExplorer & BaseHeroTab with mocked shinywidgets
+        wexp = _DemoWidgetPlotter()
+        _bind_component_mock(wexp, state, {"plot_type": "bar", "plot_bar_title": "WidgetPlot"})
+        fake_sw = MagicMock()
+        fake_sw.output_widget.return_value = shiny_ui.div(id="custom_widget_chart")
+        fake_sw.render_widget.side_effect = lambda fn: fn
+        fake_sw.render_altair.side_effect = lambda fn: fn
+        fake_sw.as_widget.side_effect = lambda obj: {"widget": obj}
+        with patch.dict("sys.modules", {"shinywidgets": fake_sw}):
+            canvas_html = str(_DemoWidgetPlotter.plot_canvas_ui.fn(wexp))  # ty: ignore[call-non-callable]
+            assert "custom_widget_chart" in canvas_html
+            assert _DemoWidgetPlotter.render_main_chart.fn(wexp) == {  # ty: ignore[call-non-callable]
+                "subject": "hero_art",
+                "title": "WidgetPlot",
+                "theme": "light",
+            }
+            w_desc.renderer_factory = None
+            w_desc.bind(doc, doc.input, doc.output, doc.session)
+
+            hero_html = str(_DemoHeroTab._render_ui())
+            assert "Welcome to ShinyKit" in hero_html
+            assert "Step 1" in hero_html
+
+        hero = _DemoHeroTab(color_mode=lambda: "dark")
+        _bind_component_mock(hero, state)
+        assert hero._resolve_active_theme() == "dark"
+        hero._color_mode_fn = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        state.color_mode = "light"
+        assert hero._resolve_active_theme() == "light"
+
+        with patch.object(Component, "server", return_value=None):
+            events = hero.server("hero_id", color_mode=lambda: "dark")
+            hero.input["btn_launch"] = 2  # ty: ignore[invalid-assignment]
+            hero.input["btn_load_demo"] = 3  # ty: ignore[invalid-assignment]
+            assert events.launch_clicked() == 2
+            assert events.demo_clicked() == 3

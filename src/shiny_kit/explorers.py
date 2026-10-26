@@ -1,6 +1,7 @@
-"""High-level domain explorer components (`ArtifactSwitcher`, `TableExplorer`, `BasePlotterExplorer`)."""
+"""High-level domain explorer components (`ArtifactSwitcher`, `TableExplorer`, `BasePlotterExplorer`, `WidgetPlotterExplorer`)."""
 
-from collections.abc import Mapping, Sequence
+import importlib
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -9,10 +10,18 @@ from shiny import module, render, req
 from shiny import ui as shiny_ui
 
 from shiny_kit.component import Component
-from shiny_kit.decorators import bind_datagrid, bind_download, bind_effect, bind_output, bind_task, reactive_calc
+from shiny_kit.decorators import (
+    bind_datagrid,
+    bind_download,
+    bind_effect,
+    bind_output,
+    bind_task,
+    bind_widget,
+    reactive_calc,
+)
 from shiny_kit.state import ArtifactRegistry
 from shiny_kit.ui import EmptyState, Icon
-from shiny_kit.widgets import WidgetSelector
+from shiny_kit.widgets import PlotterWidgetSelector, WidgetSelector
 
 
 class ArtifactSwitcher[T](Component[Any]):
@@ -36,7 +45,11 @@ class ArtifactSwitcher[T](Component[Any]):
     registry_kind: ClassVar[str] = "artifacts"
     label: ClassVar[str] = "Active Artifact"
     show_count_in_label: ClassVar[bool] = True
+    show_select_label: ClassVar[bool] = True
+    select_width: ClassVar[str | None] = None
+    inline_layout: ClassVar[bool] = False
     enable_delete: ClassVar[bool] = True
+    delete_button_label: ClassVar[str] = ""
     enable_clear: ClassVar[bool] = False
     enable_download: ClassVar[bool] = False
     enable_upload: ClassVar[bool] = False
@@ -52,6 +65,10 @@ class ArtifactSwitcher[T](Component[Any]):
     def registry(self) -> ArtifactRegistry[T]:
         """Returns the target `ArtifactRegistry` on `self.state`."""
         return self.state.get_registry(self.registry_kind)
+
+    def active_for_download(self) -> T | None:
+        """Returns the artifact instance to serialize when downloading (defaults to `self.registry.active`)."""
+        return self.registry.active
 
     @classmethod
     def _render_ui(cls) -> TagChild:
@@ -98,8 +115,11 @@ class ArtifactSwitcher[T](Component[Any]):
 
     def serialize_artifact(self, item: T) -> bytes | None:
         """Serializes `item` into bytes for download. Defaults to calling `item.save()` if defined."""
-        if hasattr(item, "save"):
-            raw = item.save()  # ty: ignore[call-non-callable]
+        if hasattr(item, "save") and callable(item.save):
+            try:
+                raw = item.save(path=None)
+            except TypeError:
+                raw = item.save()
             if isinstance(raw, bytes):
                 return raw
         return None
@@ -124,7 +144,11 @@ class ArtifactSwitcher[T](Component[Any]):
 
         active_key = reg.active_key or names[0]
         active_item = reg.get(active_key)
-        select_label = f"{self.label} ({len(names)})" if self.show_count_in_label else self.label
+        select_label = (
+            (f"{self.label} ({len(names)})" if self.show_count_in_label else self.label)
+            if self.show_select_label
+            else None
+        )
         choices = {n: self.choice_label(n, reg.items[n]) for n in names}
 
         action_btns: list[TagChild] = []
@@ -144,7 +168,7 @@ class ArtifactSwitcher[T](Component[Any]):
             action_btns.append(
                 shiny_ui.input_action_button(
                     "btn_delete_artifact",
-                    "",
+                    self.delete_button_label,
                     icon=Icon.lucide("trash-2", size=14),
                     class_="btn-sm btn-outline-danger",
                 )
@@ -158,20 +182,36 @@ class ArtifactSwitcher[T](Component[Any]):
                 )
             )
 
-        body_children: list[TagChild] = [
-            shiny_ui.input_select(
-                "active_artifact_select",
-                select_label,
-                choices=choices,
-                selected=active_key,
-            ),
-        ]
-        if active_item is not None:
-            summary = self.summary_ui(active_item)
-            if summary is not None:
-                body_children.append(summary)
-        if action_btns:
-            body_children.append(shiny_ui.div(*action_btns, class_="d-flex flex-wrap gap-2 mb-2"))
+        select_node = shiny_ui.input_select(
+            "active_artifact_select",
+            select_label,
+            choices=choices,
+            selected=active_key,
+            width=self.select_width,
+        )
+
+        body_children: list[TagChild] = []
+        if self.inline_layout:
+            body_children.append(
+                shiny_ui.div(
+                    select_node,
+                    *action_btns,
+                    class_="d-flex flex-wrap align-items-center gap-2 mb-2",
+                )
+            )
+            if active_item is not None:
+                summary = self.summary_ui(active_item)
+                if summary is not None:
+                    body_children.append(summary)
+        else:
+            body_children.append(select_node)
+            if active_item is not None:
+                summary = self.summary_ui(active_item)
+                if summary is not None:
+                    body_children.append(summary)
+            if action_btns:
+                body_children.append(shiny_ui.div(*action_btns, class_="d-flex flex-wrap gap-2 mb-2"))
+
         if self.show_bottom_hr and not self.card_wrapped:
             body_children.append(shiny_ui.hr(class_="my-2"))
 
@@ -204,11 +244,11 @@ class ArtifactSwitcher[T](Component[Any]):
         self.notify(f"Cleared all {self.registry_kind}.", type_="message")
 
     def _artifact_download_filename(self) -> str:
-        return self.download_filename(self.registry.active)
+        return self.download_filename(self.active_for_download())
 
     @bind_download("download_artifact", filename=_artifact_download_filename)
     def download_artifact(self) -> Any:
-        item = self.registry.active
+        item = self.active_for_download()
         if item is not None:
             raw = self.serialize_artifact(item)
             if raw is not None:
@@ -257,6 +297,7 @@ class TableExplorer[M](Component[Any]):
     empty_message: ClassVar[str] = "Fit or select a model in the sidebar to inspect tables."
     csv_prefix: ClassVar[str] = "export"
     grid_height: ClassVar[str] = "520px"
+    grid_output_id: ClassVar[str] = "table_datagrid"
 
     @classmethod
     def _render_ui(cls) -> TagChild:
@@ -351,10 +392,10 @@ class TableExplorer[M](Component[Any]):
                 title=self.empty_title,
                 message=self.empty_message,
             ).ui()
-        return shiny_ui.output_data_frame("estimates_datagrid")
+        return shiny_ui.output_data_frame(self.grid_output_id)
 
-    @bind_datagrid("estimates_datagrid", filters=True, height="520px")
-    def estimates_datagrid(self) -> Any:
+    @bind_datagrid(id_attr="grid_output_id", height_attr="grid_height", filters=True)
+    def render_table_datagrid(self) -> Any:
         df = self.active_table_df()
         req(df is not None)
         assert df is not None
@@ -376,7 +417,7 @@ class BasePlotterExplorer[M](Component[Any]):
 
     Subclasses bind a `plotter_registry` mapping plot keys to `(label, plotter_cls)` pairs,
     configure `widget_selector_cls`, implement `active_subject()`, and bind a chart output
-    renderer (such as `@bind_altair("main_altair_chart")` in an Altair-specialized subclass).
+    renderer (such as `WidgetPlotterExplorer`).
 
     Attributes:
         plotter_registry (ClassVar[Mapping[str, tuple[str, type[Any]]]]): Mapping of `{plot_key: (label, plotter_cls)}`.
@@ -385,17 +426,17 @@ class BasePlotterExplorer[M](Component[Any]):
         param_prefix (ClassVar[str]): Input ID prefix for introspected plotter widgets.
         sidebar_width (ClassVar[int]): Width of the plot controls sidebar in pixels.
         chart_height (ClassVar[str]): CSS height of the chart output widget.
-        chart_output_id (ClassVar[str]): Output ID of the main chart widget. Defaults to `"main_altair_chart"`.
+        chart_output_id (ClassVar[str]): Output ID of the main chart widget. Defaults to `"main_chart"`.
     """
 
     plotter_registry: ClassVar[Mapping[str, tuple[str, type[Any]]]] = {}
-    widget_selector_cls: ClassVar[type[WidgetSelector]] = WidgetSelector
+    widget_selector_cls: ClassVar[type[WidgetSelector]] = PlotterWidgetSelector
     default_plot_key: ClassVar[str] = ""
     param_prefix: ClassVar[str] = "plot"
     download_prefix: ClassVar[str] = "plot"
     sidebar_width: ClassVar[int] = 310
     chart_height: ClassVar[str] = "72vh"
-    chart_output_id: ClassVar[str] = "main_altair_chart"
+    chart_output_id: ClassVar[str] = "main_chart"
     empty_icon: ClassVar[str] = "chart-bar"
     empty_title: ClassVar[str] = "No Active Model to Plot"
     empty_message: ClassVar[str] = "Fit or select a model in the sidebar to explore interactive visualizations."
@@ -442,6 +483,18 @@ class BasePlotterExplorer[M](Component[Any]):
         """Override in subclasses to render the output container widget for `self.chart_output_id`."""
         raise NotImplementedError
 
+    def resolve_selected_plot(
+        self,
+        subject: M,
+        choices: dict[str, str],
+        current_plot: str | None,
+    ) -> str | None:
+        """Selects the active plot key given `choices` and the previous `current_plot`."""
+        if not choices:
+            return None
+        fallback = self.default_plot_key if self.default_plot_key in choices else next(iter(choices.keys()), None)
+        return str(current_plot) if current_plot in choices else fallback
+
     def resolved_plot_key(self, subject: M) -> str | None:
         """Resolves the currently selected valid plot key for `subject`."""
         choices = self.available_choices(subject)
@@ -459,8 +512,7 @@ class BasePlotterExplorer[M](Component[Any]):
 
         choices = self.available_choices(subject)
         current_plot = self.val("plot_type", isolate=True)
-        fallback = self.default_plot_key if self.default_plot_key in choices else next(iter(choices.keys()), None)
-        selected_plot = str(current_plot) if current_plot in choices else fallback
+        selected_plot = self.resolve_selected_plot(subject, choices, current_plot)
 
         header = self.selector_header_ui(subject)
         return shiny_ui.div(
@@ -524,3 +576,33 @@ class BasePlotterExplorer[M](Component[Any]):
                 message=self.empty_message,
             ).ui()
         return self.render_chart_widget()
+
+
+class WidgetPlotterExplorer[M](BasePlotterExplorer[M]):
+    """Interactive widget plotter explorer with `PlotterWidgetSelector` controls and container auto-sizing.
+
+    Lazily uses `shinywidgets.output_widget` and `bind_widget` so `shiny-kit` remains free of
+    charting library dependencies while providing a ready-to-use base class for Altair/Plotly/widget
+    plotter explorers.
+    """
+
+    resizer: ClassVar[Callable[[Any, float | None, float | None], Any] | None] = None
+
+    def render_chart_widget(self) -> TagChild:
+        """Renders the `shinywidgets.output_widget` container for `self.chart_output_id`."""
+        shinywidgets = importlib.import_module("shinywidgets")
+        return shinywidgets.output_widget(
+            self.chart_output_id,
+            width="100%",
+            height=self.chart_height,
+            fill=True,
+            fillable=True,
+        )
+
+    @bind_widget(id_attr="chart_output_id")
+    def render_main_chart(self) -> Any:
+        """Reactively renders `self.current_chart()` fitted to its container."""
+        chart = self.current_chart()
+        req(chart is not None)
+        assert chart is not None
+        return chart

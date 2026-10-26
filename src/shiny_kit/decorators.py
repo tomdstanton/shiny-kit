@@ -1,9 +1,11 @@
 """Reactive descriptors and class-based server binding decorators (`BaseBinder`, `bind_*`)."""
 
 import asyncio
+import importlib
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import shiny.ui as shiny_ui
@@ -16,6 +18,15 @@ from shiny_kit.warnings import WarningCatcher
 
 if TYPE_CHECKING:
     from shiny_kit.component import Component
+
+
+@lru_cache(maxsize=256)
+def _callable_param_count(fn: Callable[..., Any]) -> int:
+    """Returns the number of parameters accepted by `fn` (cached across invocations)."""
+    try:
+        return len(inspect.signature(fn).parameters)
+    except (ValueError, TypeError):
+        return 1
 
 
 def _wrap_sync_or_async(
@@ -192,15 +203,47 @@ class bind_output(BaseBinder):
         id_ (str | None): Optional explicit output ID. Defaults to the decorated method's name.
     """
 
-    def __init__(self, renderer_factory: Any, id_: str | None = None) -> None:
+    def __init__(
+        self,
+        renderer_factory: Any,
+        id_: str | None = None,
+        *,
+        id_attr: str | None = None,
+    ) -> None:
         super().__init__()
         self.renderer_factory = renderer_factory
         self.id_ = id_
+        self.id_attr = id_attr
 
     @property
     def target_id(self) -> str:
         """Resolved Shiny output ID."""
         return self.id_ or self.name
+
+    def resolve_target_id(self, component: "Component[Any] | None" = None) -> str:
+        """Resolves the Shiny output ID from `component.<id_attr>`, `self.id_`, or `self.name`."""
+        if component is not None and self.id_attr:
+            attr_val = getattr(component, self.id_attr, None)
+            if isinstance(attr_val, str) and attr_val:
+                return attr_val
+        return self.id_ or self.name
+
+    def client_dimensions(self, component: "Component[Any]") -> tuple[float | None, float | None]:
+        """Reads `(width, height)` in pixels from `session.clientdata` for the resolved output ID."""
+        w: float | None = None
+        h: float | None = None
+        sess = getattr(component, "_session", None)
+        target_id = self.resolve_target_id(component)
+        if sess is not None and hasattr(sess, "clientdata"):
+            try:
+                w = sess.clientdata.output_width(target_id)
+            except Exception:
+                w = None
+            try:
+                h = sess.clientdata.output_height(target_id)
+            except Exception:
+                h = None
+        return w, h
 
     def transform(self, component: "Component[Any]", value: Any) -> Any:
         """Hook for subclasses to transform the method's return value before passing it to the renderer."""
@@ -239,7 +282,7 @@ class bind_output(BaseBinder):
     ) -> None:
         """Wraps the bound method with `requires` gating and registers it on `output`."""
         method = getattr(component, self.name)
-        target_id = self.target_id
+        target_id = self.resolve_target_id(component)
         guarded = self._wrap_gated_renderer(component, method, target_id)
         output(id=target_id)(self.renderer_factory(guarded))
 
@@ -251,6 +294,7 @@ class bind_datagrid(bind_output):
         selection_mode (Literal["none", "row", "rows"]): Row selection mode.
         filters (bool): Whether to enable per-column filter headers in the DataGrid.
         height (str | int | None): Optional CSS height string or pixel integer.
+        height_attr (str | None): Optional attribute name on the component resolving the DataGrid height.
         width (str | int): CSS width string or pixel integer. Defaults to `"100%"`.
     """
 
@@ -258,28 +302,96 @@ class bind_datagrid(bind_output):
         self,
         id_: str | None = None,
         *,
+        id_attr: str | None = None,
         selection_mode: Literal["none", "row", "rows"] = "none",
         filters: bool = True,
         height: str | int | None = None,
+        height_attr: str | None = None,
         width: str | int = "100%",
     ) -> None:
-        super().__init__(render.data_frame, id_=id_)
+        super().__init__(render.data_frame, id_=id_, id_attr=id_attr)
         self.selection_mode: Literal["none", "row", "rows"] = selection_mode
         self.filters = filters
         self.height = height
+        self.height_attr = height_attr
         self.width = width
 
     def transform(self, component: "Component[Any]", value: Any) -> Any:
         """Wraps non-null tabular values into `shiny.render.DataGrid`."""
         if value is not None and not isinstance(value, (render.DataGrid, render.DataTable)):
+            resolved_height = getattr(component, self.height_attr, self.height) if self.height_attr else self.height
             return render.DataGrid(
                 value,
                 selection_mode=self.selection_mode,
                 filters=self.filters,
-                height=self.height,
+                height=resolved_height,
                 width=self.width,
             )
         return value
+
+
+class bind_widget(bind_output):
+    """Descriptor & decorator binding a method returning an interactive widget/chart to `shinywidgets`.
+
+    Lazily imports `shinywidgets` (defaulting to `shinywidgets.render_altair` or `render_widget`)
+    and optionally adapts the returned widget to its client container dimensions via a pluggable
+    `resizer` callback `(widget, width, height) -> widget` (or `component.resizer`).
+
+    Attributes:
+        autosize (bool): Whether to resize the returned widget using `client_dimensions(component)`.
+        resizer (Callable[[Any, float | None, float | None], Any] | None): Optional resizer callback.
+    """
+
+    def __init__(
+        self,
+        id_: str | None = None,
+        *,
+        id_attr: str | None = None,
+        renderer_factory: Any = None,
+        autosize: bool = True,
+        resizer: Callable[[Any, float | None, float | None], Any] | None = None,
+    ) -> None:
+        resolved_factory = renderer_factory
+        if resolved_factory is None:
+            try:
+                resolved_factory = self._default_renderer_factory()
+            except Exception:
+                resolved_factory = None
+        super().__init__(resolved_factory, id_=id_, id_attr=id_attr)
+        self.autosize = autosize
+        self.resizer = resizer
+
+    @staticmethod
+    def _default_renderer_factory() -> Any:
+        shinywidgets = importlib.import_module("shinywidgets")
+        return getattr(shinywidgets, "render_altair", shinywidgets.render_widget)
+
+    def transform(self, component: "Component[Any]", value: Any) -> Any:
+        """Resizes the returned widget to fit the active client container dimensions when `autosize=True`."""
+        if not self.autosize or value is None:
+            return value
+        w, h = self.client_dimensions(component)
+        resizer_fn = self.resizer
+        if resizer_fn is None:
+            comp_resizer = getattr(type(component), "resizer", None) or getattr(component, "resizer", None)
+            if callable(comp_resizer):
+                resizer_fn = comp_resizer
+        if resizer_fn is not None:
+            return resizer_fn(value, w, h)
+        if hasattr(value, "fit_to_container") and callable(value.fit_to_container):
+            return value.fit_to_container(width=w, height=h)
+        return value
+
+    def bind(
+        self,
+        component: "Component[Any]",
+        input: Inputs,
+        output: Outputs,
+        session: Session,
+    ) -> None:
+        if self.renderer_factory is None:
+            self.renderer_factory = self._default_renderer_factory()
+        super().bind(component, input, output, session)
 
 
 class bind_download(bind_output):
@@ -565,8 +677,10 @@ class bind_task(BaseBinder):
             cb: Callable[..., Any] = (
                 getattr(component, self.on_success) if isinstance(self.on_success, str) else self.on_success
             )
-            sig = inspect.signature(cb)
-            custom_msg = cb(res) if len(sig.parameters) == 1 else cb(component, res)
+            is_bound = getattr(cb, "__self__", None) is not None
+            raw_fn = getattr(cb, "__func__", cb)
+            param_cnt = _callable_param_count(raw_fn) - (1 if is_bound else 0)
+            custom_msg = cb(res) if param_cnt == 1 else cb(component, res)
 
         if custom_msg:
             component.notify(custom_msg, type_="message")

@@ -1,6 +1,7 @@
 """Zero-dependency, context-propagated hierarchical progress reporting."""
 
 import asyncio
+import sys
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -12,6 +13,16 @@ import shiny.ui as shiny_ui
 from shiny import Session
 
 type ProgressCallback = Callable[[float, str | None, str | None], None]
+
+_SHARED_VAR_ATTR = "__active_progress_contextvar__"
+
+
+def _get_shared_contextvar() -> ContextVar[Any]:
+    var = getattr(sys, _SHARED_VAR_ATTR, None)
+    if not isinstance(var, ContextVar):
+        var = ContextVar(_SHARED_VAR_ATTR, default=None)
+        setattr(sys, _SHARED_VAR_ATTR, var)
+    return var
 
 
 @dataclass(slots=True)
@@ -169,7 +180,7 @@ class ProgressReporter:
 
 
 _NOOP_REPORTER = ProgressReporter()
-_ACTIVE_PROGRESS: ContextVar[ProgressReporter] = ContextVar("shiny_kit_active_progress", default=_NOOP_REPORTER)
+_ACTIVE_PROGRESS: ContextVar[ProgressReporter | None] = _get_shared_contextvar()
 
 
 def current_progress() -> ProgressReporter:
@@ -178,7 +189,8 @@ def current_progress() -> ProgressReporter:
     Returns:
         Active `ProgressReporter` for the current execution context.
     """
-    return _ACTIVE_PROGRESS.get()
+    active = _ACTIVE_PROGRESS.get()
+    return active if active is not None else _NOOP_REPORTER
 
 
 @contextmanager

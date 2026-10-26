@@ -1,14 +1,18 @@
-"""Core OOP PyShiny lifecycle (`Component`, `SubComponentProxy`, `subcomponent`, `Tab`, `ParentTab`)."""
+"""Core OOP PyShiny lifecycle (`Component`, `SubComponentProxy`, `subcomponent`, `Tab`, `ParentTab`, `BaseHeroTab`)."""
 
+import importlib
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, Self, get_args, overload
 
 import shiny.ui as shiny_ui
-from htmltools import HTML, Tag
+from htmltools import HTML, Tag, TagChild
 from shiny import Inputs, Outputs, Session, module, reactive, render
 
 from shiny_kit.decorators import BaseBinder
 from shiny_kit.state import BaseSessionState, Requirement
 from shiny_kit.ui import Icon
+from shiny_kit.widgets import DocstringParser
 
 
 class _session_attr[T]:
@@ -107,6 +111,19 @@ class Component[S: BaseSessionState]:
         self._session: Session | None = None
         self._state: S | None = None
         self.module_id: str = ""
+        self._version_tracker: dict[str, Any] = {}
+
+    def has_changed(self, key: str, version: Any, *, initial: Any = 0) -> bool:
+        """Tracks `version` under `key` and returns `True` when `version` differs from the previously recorded value."""
+        prev = self._version_tracker.get(key, initial)
+        if version != prev:
+            self._version_tracker[key] = version
+            return True
+        return False
+
+    def sync_version(self, key: str, version: Any) -> None:
+        """Updates the recorded version for `key` without reporting a change."""
+        self._version_tracker[key] = version
 
     @property
     def has_session(self) -> bool:
@@ -362,12 +379,7 @@ class Tab[S: BaseSessionState](Component[S]):
     @classmethod
     def title(cls) -> str:
         """Derives title from the class docstring without inheriting parent docstrings."""
-        raw_doc = cls.__dict__.get("__doc__")
-        if raw_doc:
-            summary = raw_doc.strip().splitlines()[0].strip().rstrip(".")
-            if summary:
-                return summary
-        return cls.__name__.removesuffix("Tab")
+        return DocstringParser.display_label(cls, strip_suffix="Tab", inherit_doc=False)
 
     @classmethod
     def ui(cls, id_: str, *args: Any, **kwargs: Any) -> shiny_ui._navs.NavPanel:
@@ -397,3 +409,533 @@ class ParentTab[S: BaseSessionState](Tab[S]):
         self._child_instances = [child_cls() for child_cls in self.children]
         for child_instance in self._child_instances:
             child_instance.server(child_instance.__class__.__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class HeroStatSpec:
+    """Static specification for a metric tile in the `.sv-stat-strip` hero strip.
+
+    Attributes:
+        value (str): Highlighted headline metric value (rendered with gradient text).
+        label (str): Descriptive caption displayed beneath `value`.
+    """
+
+    value: str
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowStepSpec:
+    """Static specification for a pillar/workflow card below the Hero section.
+
+    Attributes:
+        step_label (str): Card heading for the pipeline step.
+        description (str): Body copy describing the step's capabilities.
+        icon (str): Lucide icon name rendered in the card header. Defaults to `"sparkles"`.
+        badge (str): Optional uppercase pill badge text rendered at the top-right of the card.
+        metrics (tuple[str, ...]): Optional metric pills displayed inside the card footer.
+        target_tab (str | None): Optional target navbar tab ID associated with the step.
+    """
+
+    step_label: str
+    description: str
+    icon: str = "sparkles"
+    badge: str = ""
+    metrics: tuple[str, ...] = ()
+    target_tab: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HeroConfig:
+    """Configuration contract for a `BaseHeroTab` landing view.
+
+    Attributes:
+        badge_text (str): Eyebrow pill text displayed above the headline.
+        headline (str): Main gradient headline text.
+        subtitle (str): Lead paragraph text beneath the headline.
+        primary_cta_label (str): Label for the primary action button.
+        secondary_cta_label (str): Label for the secondary demo-loading button.
+        preview_title (str): Header title of the glassmorphic live preview card.
+        workflow_steps (tuple[WorkflowStepSpec, ...]): Sequence of workflow cards rendered below the fold.
+        stats (tuple[HeroStatSpec, ...]): Sequence of metrics rendered in the `.sv-stat-strip` bar.
+    """
+
+    badge_text: str
+    headline: str
+    subtitle: str
+    primary_cta_label: str
+    secondary_cta_label: str
+    preview_title: str
+    workflow_steps: tuple[WorkflowStepSpec, ...]
+    stats: tuple[HeroStatSpec, ...] = ()
+    pipeline_heading: str = "Workflow Pipeline"
+    pipeline_subtitle: str = "Explore each stage of the workflow below."
+
+
+@dataclass(frozen=True, slots=True)
+class HomeTabEvents:
+    """Read-only reactive event streams emitted by `BaseHeroTab.server()`.
+
+    Attributes:
+        launch_clicked (Callable[[], int]): Reactive getter returning the click count of the primary launch button.
+        demo_clicked (Callable[[], int]): Reactive getter returning the click count of the demo cohort button.
+    """
+
+    launch_clicked: Callable[[], int]
+    demo_clicked: Callable[[], int]
+
+
+HERO_CSS = """
+body {
+    overflow-x: clip;
+}
+
+:root,
+[data-bs-theme="light"] {
+    --sv-gradient: linear-gradient(135deg, #7c3aed 0%, #6366f1 52%, #db2777 100%);
+    --sv-glow: rgba(139, 92, 246, 0.16);
+    --sv-border: rgba(139, 92, 246, 0.30);
+    --sv-surface-tint: linear-gradient(145deg, rgba(124, 58, 237, 0.09), rgba(219, 39, 119, 0.05));
+    --sv-accent: #7c3aed;
+    --sv-accent-soft: rgba(139, 92, 246, 0.12);
+    --sv-card-bg: rgba(255, 255, 255, 0.86);
+    --sv-stat-bg: rgba(15, 23, 42, 0.035);
+    --bs-primary: #7c3aed;
+    --bs-primary-rgb: 124, 58, 237;
+    --bs-link-color: #7c3aed;
+    --bs-link-hover-color: #6d28d9;
+}
+
+[data-bs-theme="dark"] {
+    --sv-gradient: linear-gradient(135deg, #a78bfa 0%, #818cf8 52%, #f472b6 100%);
+    --sv-glow: rgba(167, 139, 250, 0.20);
+    --sv-border: rgba(167, 139, 250, 0.32);
+    --sv-surface-tint: linear-gradient(145deg, rgba(124, 58, 237, 0.16), rgba(219, 39, 119, 0.10));
+    --sv-accent: #c084fc;
+    --sv-accent-soft: rgba(168, 85, 247, 0.16);
+    --sv-card-bg: rgba(15, 23, 42, 0.78);
+    --sv-stat-bg: rgba(15, 23, 42, 0.58);
+    --bs-body-bg: #0b1120;
+    --bs-tertiary-bg: #111827;
+    --bs-primary: #8b5cf6;
+    --bs-primary-rgb: 139, 92, 246;
+}
+
+[data-bs-theme="dark"] .bg-light {
+    background-color: var(--bs-tertiary-bg) !important;
+    color: var(--bs-body-color) !important;
+}
+
+[data-bs-theme="dark"] .text-dark {
+    color: var(--bs-body-color) !important;
+}
+
+.navbar-brand .sv-brand-icon svg {
+    color: var(--sv-accent);
+}
+
+.sv-hero {
+    position: relative;
+    padding: 2.4rem 2.2rem;
+    margin-top: 0.75rem;
+    margin-bottom: 1.5rem;
+    border-radius: 1rem;
+    background:
+        radial-gradient(circle at 85% 15%, var(--sv-glow), transparent 55%),
+        var(--sv-surface-tint);
+    border: 1px solid var(--sv-border);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    container-type: inline-size;
+}
+
+.sv-hero-eyebrow,
+.hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    font-size: 0.76rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    padding: 0.32rem 0.78rem;
+    margin-bottom: 0.9rem;
+    border-radius: 999px;
+    background: var(--sv-accent-soft);
+    color: var(--sv-accent);
+    border: 1px solid var(--sv-border);
+}
+
+.hero-headline {
+    background: var(--sv-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
+}
+
+.hero-cta-group {
+    display: inline-grid;
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+}
+
+.hero-cta-group > .btn {
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+}
+
+@container (min-width: 1120px) {
+    .hero-cta-group {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.sv-btn-primary.btn {
+    color: #ffffff !important;
+    background: var(--sv-gradient) !important;
+    border: none !important;
+    border-radius: 0.6rem;
+    font-weight: 600;
+    box-shadow: 0 6px 18px -5px var(--sv-glow);
+    transition: transform 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+}
+
+.sv-btn-primary.btn:hover {
+    transform: translateY(-1px);
+    opacity: 0.95;
+}
+
+.sv-btn-secondary.btn {
+    color: var(--bs-body-color) !important;
+    background: rgba(148, 163, 184, 0.10) !important;
+    border: 1px solid var(--sv-border) !important;
+    border-radius: 0.6rem;
+    font-weight: 600;
+    transition: transform 0.16s ease, border-color 0.16s ease, background-color 0.16s ease;
+}
+
+.sv-btn-secondary.btn:hover {
+    transform: translateY(-1px);
+    border-color: var(--sv-accent) !important;
+    background: var(--sv-accent-soft) !important;
+}
+
+.hero-glass-card {
+    background: var(--sv-card-bg);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--sv-border);
+    border-radius: 0.9rem;
+    box-shadow: 0 14px 34px -12px var(--sv-glow);
+}
+
+.sv-stat-strip {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+    margin-top: 1.75rem;
+    padding-top: 1.35rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.20);
+}
+
+@media (min-width: 640px) {
+    .sv-stat-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (min-width: 992px) {
+    .sv-stat-strip {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+}
+
+.sv-stat-item {
+    padding: 0.7rem 0.9rem;
+    border-radius: 0.65rem;
+    background: var(--sv-stat-bg);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.sv-stat-value {
+    display: block;
+    font-size: 1.2rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    background: var(--sv-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+}
+
+.sv-stat-label {
+    display: block;
+    font-size: 0.76rem;
+    opacity: 0.84;
+    margin-top: 0.15rem;
+    line-height: 1.4;
+}
+
+.sv-pillar-card,
+.hero-workflow-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 1.45rem 1.4rem;
+    border-radius: 0.9rem;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    background: var(--sv-card-bg);
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+    overflow: hidden;
+}
+
+.sv-pillar-card::before,
+.hero-workflow-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 4px;
+    background: var(--sv-gradient);
+}
+
+.sv-pillar-card:hover,
+.hero-workflow-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--sv-border);
+    box-shadow: 0 14px 32px -12px var(--sv-glow);
+}
+
+.sv-pillar-badge {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.22rem 0.58rem;
+    border-radius: 999px;
+    background: var(--sv-accent-soft);
+    color: var(--sv-accent);
+    border: 1px solid var(--sv-border);
+}
+
+.sv-pillar-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.sv-metric-pill {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.18rem 0.54rem;
+    border-radius: 0.4rem;
+    background: rgba(148, 163, 184, 0.10);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+}
+"""
+
+
+class BaseHeroTab[S: BaseSessionState](Tab[S]):
+    """Reusable glassmorphic Hero & Workflow landing `Tab` component.
+
+    Renders a two-column `.sv-hero` banner with gradient headline, primary/secondary CTA buttons,
+    an interactive live preview widget card, `.sv-stat-strip` metric tiles, and `.sv-pillar-card`
+    pipeline cards below the fold.
+    """
+
+    icon: HTML | None = Icon.lucide("house")
+    config: ClassVar[HeroConfig]
+    preview_icon: ClassVar[str] = "chart-network"
+    preview_output_id: ClassVar[str] = "hero_preview"
+    preview_height: ClassVar[str] = "320px"
+    pipeline_heading: ClassVar[str | None] = None
+    pipeline_subtitle: ClassVar[str | None] = None
+
+    def __init__(
+        self,
+        *,
+        config: HeroConfig | None = None,
+        color_mode: Callable[[], str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.instance_config: HeroConfig = config if config is not None else self.config
+        self._color_mode_fn = color_mode
+
+    @classmethod
+    def render_preview_controls_ui(cls) -> TagChild:
+        """Optional header controls rendered on the right side of the live preview card."""
+        return None
+
+    @classmethod
+    def render_preview_widget_ui(cls) -> TagChild:
+        """Renders the output widget container inside the glassmorphic preview card."""
+        shinywidgets = importlib.import_module("shinywidgets")
+        return shinywidgets.output_widget(
+            cls.preview_output_id,
+            width="100%",
+            height=cls.preview_height,
+            fill=True,
+            fillable=True,
+        )
+
+    @classmethod
+    def _render_ui(cls) -> TagChild:
+        cfg = cls.config
+        return shiny_ui.div(
+            shiny_ui.head_content(shiny_ui.tags.style(HERO_CSS)),
+            shiny_ui.div(
+                shiny_ui.div(
+                    shiny_ui.layout_columns(
+                        shiny_ui.div(
+                            shiny_ui.h1(
+                                cfg.headline,
+                                class_="display-5 fw-bold hero-headline mb-3",
+                            ),
+                            shiny_ui.p(
+                                cfg.subtitle,
+                                class_="lead text-body-secondary mb-4",
+                            ),
+                            shiny_ui.div(
+                                shiny_ui.input_action_button(
+                                    "btn_launch",
+                                    cfg.primary_cta_label,
+                                    icon=Icon.lucide("rocket", size=16),
+                                    class_="sv-btn-primary btn-lg px-4",
+                                ),
+                                shiny_ui.input_action_button(
+                                    "btn_load_demo",
+                                    cfg.secondary_cta_label,
+                                    icon=Icon.lucide("play", size=16),
+                                    class_="sv-btn-secondary btn-lg px-4",
+                                ),
+                                class_="hero-cta-group",
+                            ),
+                        ),
+                        shiny_ui.div(
+                            shiny_ui.div(
+                                shiny_ui.div(
+                                    Icon.lucide(cls.preview_icon, size=16, class_="text-primary me-2"),
+                                    shiny_ui.span(cfg.preview_title, class_="fw-semibold small"),
+                                    class_="d-flex align-items-center",
+                                ),
+                                shiny_ui.div(
+                                    cls.render_preview_controls_ui(),
+                                    class_="d-flex align-items-center gap-3",
+                                ),
+                                class_="d-flex flex-wrap justify-content-between align-items-center pb-2 mb-2 border-bottom",
+                            ),
+                            cls.render_preview_widget_ui(),
+                            class_="hero-glass-card p-3 p-md-4",
+                        ),
+                        col_widths={"sm": (12, 12), "lg": (6, 6)},
+                        class_="align-items-center g-4",
+                        fill=False,
+                    ),
+                    shiny_ui.div(
+                        *[
+                            shiny_ui.div(
+                                shiny_ui.span(stat.value, class_="sv-stat-value"),
+                                shiny_ui.span(stat.label, class_="sv-stat-label"),
+                                class_="sv-stat-item",
+                            )
+                            for stat in cfg.stats
+                        ],
+                        class_="sv-stat-strip",
+                    )
+                    if cfg.stats
+                    else None,
+                    class_="sv-hero",
+                ),
+                shiny_ui.div(
+                    shiny_ui.div(
+                        shiny_ui.h4(cls.pipeline_heading or cfg.pipeline_heading, class_="fw-bold mb-1"),
+                        shiny_ui.p(
+                            cls.pipeline_subtitle or cfg.pipeline_subtitle,
+                            class_="text-body-secondary mb-4",
+                        ),
+                    ),
+                    shiny_ui.layout_column_wrap(
+                        *[
+                            shiny_ui.div(
+                                shiny_ui.div(
+                                    shiny_ui.div(
+                                        shiny_ui.span(
+                                            Icon.lucide(step.icon, size=18),
+                                            style="color: var(--sv-accent); background: var(--sv-accent-soft);",
+                                            class_="p-2 rounded-3 d-inline-flex align-items-center justify-content-center",
+                                        ),
+                                        shiny_ui.span(
+                                            step.badge,
+                                            class_="sv-pillar-badge",
+                                        )
+                                        if step.badge
+                                        else None,
+                                        class_="d-flex justify-content-between align-items-center mb-3",
+                                    ),
+                                    shiny_ui.h6(step.step_label, class_="fw-bold mb-2"),
+                                    shiny_ui.p(step.description, class_="text-body-secondary small mb-0"),
+                                ),
+                                shiny_ui.div(
+                                    *[shiny_ui.span(m, class_="sv-metric-pill") for m in step.metrics],
+                                    class_="sv-pillar-metrics",
+                                )
+                                if step.metrics
+                                else None,
+                                class_="sv-pillar-card hero-workflow-card h-100",
+                            )
+                            for step in cfg.workflow_steps
+                        ],
+                        width=1 / 3,
+                        class_="g-4",
+                        fill=False,
+                    ),
+                    class_="py-3",
+                ),
+                class_="container py-3",
+            ),
+        )
+
+    def _resolve_active_theme(self) -> Literal["light", "dark"]:
+        if self._color_mode_fn is not None:
+            try:
+                mode_val = self._color_mode_fn()
+                return "dark" if mode_val == "dark" else "light"
+            except Exception:
+                pass
+        return "dark" if self.state.color_mode == "dark" else "light"
+
+    def server(
+        self,
+        id_: str,
+        *,
+        color_mode: Callable[[], str] | None = None,
+        **_: Any,
+    ) -> HomeTabEvents:
+        """Binds server logic for the Hero tab and returns `HomeTabEvents` streams."""
+        if color_mode is not None:
+            self._color_mode_fn = color_mode
+        super().server(id_)
+
+        def _launch_clicked() -> int:
+            return int(self.val("btn_launch", default=0) or 0)
+
+        def _demo_clicked() -> int:
+            return int(self.val("btn_load_demo", default=0) or 0)
+
+        return HomeTabEvents(
+            launch_clicked=_launch_clicked,
+            demo_clicked=_demo_clicked,
+        )

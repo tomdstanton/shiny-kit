@@ -542,3 +542,218 @@ def test_state_and_artifact_registry() -> None:
         state.reset_all()
         assert state.reset_called is True
         assert state.datasets.count == 0
+
+
+class _FakeCol:
+    def __init__(self, vals: list[int]) -> None:
+        self.vals = vals
+
+    def head(self, n: int) -> "_FakeCol":
+        return _FakeCol(self.vals[:n])
+
+    def tail(self, n: int) -> "_FakeCol":
+        return _FakeCol(self.vals[-n:])
+
+    def to_list(self) -> list[int]:
+        return list(self.vals)
+
+
+class _FakeDF:
+    def __init__(self, rows: list[int]) -> None:
+        self.rows = rows
+        self.shape = (len(rows), 1)
+        self.columns = ["x"]
+        self.schema = {"x": "Int64"}
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, key: str) -> _FakeCol:
+        return _FakeCol(self.rows)
+
+
+class _FakePolarsDF(_FakeDF):
+    def hash_rows(self, seed: int = 0) -> Any:
+        rows = self.rows
+        return type(
+            "H",
+            (),
+            {"sum": lambda self: sum(rows), "__getitem__": lambda self, i: rows[i]},
+        )()
+
+
+class _FakeEst:
+    def __init__(self, c: float = 1.0) -> None:
+        self.c = c
+        self.summary_ = _FakeDF([10, 20])
+        self.warnings_: tuple[str, ...] = ()
+        self.fitted_x: Any = None
+        self.fitted_y: Any = None
+
+    def get_params(self, deep: bool = False) -> dict[str, Any]:
+        return {"c": self.c}
+
+    def fit(self, X: Any, y: Any = None) -> "_FakeEst":
+        warnings.warn("fit-warn", UserWarning, stacklevel=1)
+        self.fitted_x = X
+        self.fitted_y = y
+        return self
+
+
+class _SkCloneEst(_FakeEst):
+    def __sklearn_clone__(self) -> "_SkCloneEst":
+        return _SkCloneEst(self.c)
+
+
+def test_extended_cache_ui_and_plotter_widgets(tmp_path: Path) -> None:
+    import asyncio
+
+    from shiny_kit.ui import (
+        EcosystemPillarSpec,
+        PackageMetadata,
+        build_cli_parser,
+        package_footer,
+        run_cli,
+    )
+    from shiny_kit.widgets import NumericBounds, PlotterWidgetSelector
+
+    # 1. BaseCache DataFrame / Sparse / Array / Estimator hashing, acall_or_load, and fit_or_load
+    class _FakeSparse:
+        shape = (2, 2)
+        data = [1.0, 2.0]
+        indices = [0, 1]
+        indptr = [0, 1, 2]
+
+    class _FakeArray:
+        shape = (2,)
+        dtype = "float64"
+
+        def tobytes(self) -> bytes:
+            return b"\x00\x01\x02\x03"
+
+    cache = BaseCache(cache_dir=tmp_path / "ext_cache", persist_to_disk=True)
+    assert BaseCache.fingerprint(_FakeDF([])) != BaseCache.fingerprint(_FakeDF([1, 2]))
+    assert BaseCache.fingerprint(_FakePolarsDF([1, 2])) != BaseCache.fingerprint(_FakeSparse())
+    assert BaseCache.fingerprint(_FakeArray()) != BaseCache.fingerprint(_FakeEst(2.0))
+
+    # Bound method _call_key & acall_or_load
+    async def _run_async_cache() -> None:
+        acalls = 0
+
+        async def _acompute(v: int) -> int:
+            nonlocal acalls
+            acalls += 1
+            return v * 3
+
+        assert await cache.acall_or_load(_acompute, 4) == 12
+        assert await cache.acall_or_load(_acompute, 4) == 12
+        cache._lru.clear()
+        assert await cache.acall_or_load(_acompute, 4) == 12
+        assert acalls == 1
+        assert await cache.acall_or_load(_acompute, 4, force_refresh=True) == 12
+        assert acalls == 2
+
+    asyncio.run(_run_async_cache())
+
+    # fit_or_load (initial fit, memory hit, disk hit, with y)
+    est = _FakeEst(1.5)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        fitted1 = cache.fit_or_load(est, [1, 2, 3])
+        assert fitted1.c == 1.5
+        assert "fit-warn" in fitted1.warnings_
+        assert len(rec) == 1
+
+        # Memory hit re-emits warning without re-fitting
+        fitted2 = cache.fit_or_load(est, [1, 2, 3])
+        assert fitted2 is fitted1
+
+        # Disk hit
+        cache._lru.clear()
+        fitted3 = cache.fit_or_load(est, [1, 2, 3])
+        assert fitted3.c == 1.5
+
+        # With y argument and __sklearn_clone__
+        fitted_y = cache.fit_or_load(_SkCloneEst(3.0), [1], y=[0])
+        assert fitted_y.fitted_y == [0]
+
+    # 2. PackageMetadata, package_footer, build_cli_parser, run_cli
+    meta = PackageMetadata.load("shiny-kit")
+    assert meta.name == "shiny-kit"
+    assert isinstance(meta.short_version, str)
+
+    fake_toml = tmp_path / "pyproject.toml"
+    fake_toml.write_text(
+        '[project]\nname = "demo-pkg"\ndescription = "Demo app"\nauthors = [{name = "Alice", email = "a@b.c"}]\n[project.urls]\nHomepage = "https://example.com"\n',
+        encoding="utf-8",
+    )
+    fallback_meta = PackageMetadata.load("nonexistent-pkg-xyz-123", pyproject_path=fake_toml)
+    assert fallback_meta.name == "demo-pkg"
+    assert fallback_meta.author == "Alice"
+
+    footer_tag = package_footer(
+        meta=fallback_meta,
+        brand_title="DemoBrand",
+        pillars=[
+            EcosystemPillarSpec(
+                name="DemoPillar",
+                slug="demo",
+                icon="sparkles",
+                url="https://example.com",
+                description="Desc",
+                is_active=True,
+            )
+        ],
+    )
+    footer_html = str(footer_tag)
+    assert "DemoBrand" in footer_html
+    assert "DemoPillar" in footer_html
+    assert "is-active" in footer_html
+
+    parser = build_cli_parser("demo-cli", package_name="shiny-kit", default_port=9000)
+    parsed = parser.parse_args(["--host", "0.0.0.0", "--port", "8123", "--reload", "--no-launch-browser"])
+    assert parsed.host == "0.0.0.0"
+    assert parsed.port == 8123
+    assert parsed.reload is True
+    assert parsed.launch_browser is False
+
+    with patch("shiny_kit.ui.run_app") as mock_run_app:
+        rc = run_cli(
+            "demo.app:app",
+            prog="demo-cli",
+            reload_dirs=[tmp_path],
+            app_dir=tmp_path,
+            argv=["--port", "8080", "--no-launch-browser"],
+        )
+        assert rc == 0
+        mock_run_app.assert_called_once()
+
+    # 3. NumericBounds & PlotterWidgetSelector
+    class _DemoPlotter:
+        __widget_exclude__ = ("ignored_param",)
+        __widget_constraints__ = {
+            "point_size": NumericBounds(1, 100, 5),
+            "line_width": (0.5, 10.0, 0.5),
+        }
+
+        def __init__(
+            self,
+            title: str = "Plot",
+            color_scheme: str = "custom_scheme",
+            fill_color: str = "#ff5500",
+            point_size: int = 20,
+            line_width: float = 1.5,
+            ignored_param: int = 0,
+        ) -> None:
+            pass
+
+    psel = PlotterWidgetSelector.default()
+    grouped_widgets = psel.build_form(_DemoPlotter, prefix="plt_", group_styling=True)
+    grouped_html = "".join(str(w) for w in grouped_widgets)
+    assert "accordion" in grouped_html
+    assert "Custom_Scheme" in grouped_html or "custom_scheme" in grouped_html
+    assert "#ff5500" in grouped_html
+    assert "ignored_param" not in grouped_html
+
+    flat_widgets = psel.build_form(_DemoPlotter, prefix="plt_", group_styling=False)
+    assert len(flat_widgets) == 5

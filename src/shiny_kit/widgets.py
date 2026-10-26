@@ -83,6 +83,64 @@ class DocstringParser:
         cls._CACHE[target_cls] = params
         return dict(params)
 
+    @staticmethod
+    def display_label(target_cls: type[Any], strip_suffix: str = "", *, inherit_doc: bool = True) -> str:
+        """Derives a clean human-readable display label from a class docstring or class name.
+
+        Args:
+            target_cls: Class to inspect.
+            strip_suffix: Optional class-name suffix to strip when falling back to `__name__`.
+            inherit_doc: If `True`, inspects MRO via `inspect.getdoc(target_cls)`; if `False`,
+                only inspects `target_cls.__dict__.get("__doc__")`.
+
+        Returns:
+            Human-readable label string.
+        """
+        doc = inspect.getdoc(target_cls) if inherit_doc else target_cls.__dict__.get("__doc__")
+        if doc:
+            first_line = doc.strip().splitlines()[0].strip().rstrip(".")
+            if first_line:
+                return first_line
+        return target_cls.__name__.removesuffix(strip_suffix) if strip_suffix else target_cls.__name__
+
+    @staticmethod
+    def discover_subclasses[T](
+        base_cls: type[T],
+        *,
+        exclude_names: set[str] | None = None,
+    ) -> dict[str, type[T]]:
+        """Recursively discovers all concrete (non-abstract) subclasses of `base_cls`.
+
+        Args:
+            base_cls: Abstract or base class whose concrete subclasses should be discovered.
+            exclude_names: Optional set of subclass names to exclude from the returned mapping.
+
+        Returns:
+            Dictionary mapping concrete subclass `__name__` to the subclass type.
+        """
+        excluded = exclude_names or set()
+        found: dict[str, type[T]] = {}
+        queue = list(base_cls.__subclasses__())
+        while queue:
+            sub = queue.pop(0)
+            queue.extend(sub.__subclasses__())
+            if (
+                sub.__name__ not in excluded
+                and not inspect.isabstract(sub)
+                and not getattr(sub, "__abstractmethods__", None)
+            ):
+                found[sub.__name__] = sub
+        return found
+
+
+@dataclass(slots=True, frozen=True)
+class NumericBounds:
+    """Declarative numeric input constraints (`min_val`, `max_val`, `step`) for `WidgetSelector`."""
+
+    min_val: float | int | None = None
+    max_val: float | int | None = None
+    step: float | int = 1
+
 
 @dataclass(slots=True, frozen=True)
 class ParameterSpec:
@@ -94,6 +152,7 @@ class ParameterSpec:
         default (Any): Default value from `inspect.signature`, or `inspect.Parameter.empty`.
         docstring (str): Extracted help text from Google or NumPy docstrings.
         is_optional (bool): Whether `None` is an allowed value for this parameter.
+        bounds (NumericBounds | None): Optional resolved numeric bounds for integer/float inputs.
     """
 
     name: str
@@ -101,6 +160,7 @@ class ParameterSpec:
     default: Any
     docstring: str = ""
     is_optional: bool = False
+    bounds: NumericBounds | None = None
 
 
 type WidgetBuilder = Callable[[str, ParameterSpec], TagChild]
@@ -109,6 +169,10 @@ type TypePredicate = Callable[[ParameterSpec], bool]
 
 class WidgetSelector:
     """Introspects class parameters and maps them to PyShiny input widgets decorated with help tooltips.
+
+    Target classes may optionally declare class attributes `__widget_exclude__: ClassVar[Collection[str]]`
+    and `__widget_constraints__: ClassVar[Mapping[str, NumericBounds | tuple[float | int | None, float | int | None, float | int]]]`
+    across their MRO to customize parameter exclusions and numeric input bounds without importing `shiny_kit`.
 
     Attributes:
         default_exclude (ClassVar[set[str]]): Parameter names excluded by default during introspection.
@@ -129,8 +193,12 @@ class WidgetSelector:
         ```
     """
 
-    default_exclude: ClassVar[set[str]] = set()
+    default_exclude: ClassVar[set[str]] = {"name"}
     non_ui_types: ClassVar[tuple[type[Any], ...]] = ()
+    numeric_constraints: ClassVar[Mapping[str, NumericBounds]] = {
+        "alpha": NumericBounds(min_val=0.001, max_val=0.5, step=0.01),
+        "learning_rate": NumericBounds(min_val=0.0001, max_val=1.0, step=0.005),
+    }
     _INTROSPECT_CACHE: ClassVar[
         dict[tuple[type["WidgetSelector"], type[Any], frozenset[str]], tuple[ParameterSpec, ...]]
     ] = {}
@@ -149,6 +217,15 @@ class WidgetSelector:
             inst = cls()
             cls._DEFAULT_INSTANCES[cls] = inst
         return inst
+
+    @classmethod
+    def _is_scalar_ui_branch(cls, arg: Any) -> bool:
+        """Returns True if `arg` is a primitive scalar, Literal, or Enum directly representable by a UI input."""
+        if arg in (bool, int, float, str):
+            return True
+        if get_origin(arg) is Literal:
+            return True
+        return isinstance(arg, type) and issubclass(arg, Enum)
 
     @classmethod
     def _is_non_ui_union_branch(cls, arg: Any) -> bool:
@@ -245,35 +322,48 @@ class WidgetSelector:
         return self._build_select_input(input_id, spec, choice_map, selected=selected)
 
     def _build_int_widget(self, input_id: str, spec: ParameterSpec) -> TagChild:
+        bounds = spec.bounds or self.numeric_constraints.get(spec.name)
         if spec.default is None and spec.is_optional:
             val: int | None = None
-            min_val: int | None = 0
+            min_val: int | float | None = bounds.min_val if bounds is not None else 0
         else:
-            val = spec.default if (isinstance(spec.default, int) and not isinstance(spec.default, bool)) else 0
-            min_val = 0 if val >= 0 else None
+            val = (
+                spec.default
+                if (isinstance(spec.default, int) and not isinstance(spec.default, bool))
+                else (int(bounds.min_val) if bounds and bounds.min_val is not None else 0)
+            )
+            min_val = bounds.min_val if bounds is not None else (0 if val >= 0 else None)
+        max_val = bounds.max_val if bounds is not None else None
+        step = int(bounds.step) if bounds is not None else 1
         return shiny_ui.input_numeric(
             input_id,
             label=self._create_label(spec),
             value=val,  # ty: ignore[invalid-argument-type]
             min=min_val,
-            step=1,
+            max=max_val,
+            step=step,
         )
 
     def _build_float_widget(self, input_id: str, spec: ParameterSpec) -> TagChild:
+        bounds = spec.bounds or self.numeric_constraints.get(spec.name)
         if spec.default is None and spec.is_optional:
             val: float | None = None
-            step = 0.1
+            step: float | int = bounds.step if bounds is not None else 0.1
         else:
             val = (
                 float(spec.default)
                 if (isinstance(spec.default, (int, float)) and not isinstance(spec.default, bool))
-                else 0.0
+                else (float(bounds.min_val) if bounds and bounds.min_val is not None else 0.0)
             )
-            step = 0.01 if 0.0 < abs(val) <= 1.0 else 0.1
+            step = bounds.step if bounds is not None else (0.01 if 0.0 < abs(val) <= 1.0 else 0.1)
+        min_val = bounds.min_val if bounds is not None else None
+        max_val = bounds.max_val if bounds is not None else None
         return shiny_ui.input_numeric(
             input_id,
             label=self._create_label(spec),
             value=val,  # ty: ignore[invalid-argument-type]
+            min=min_val,
+            max=max_val,
             step=step,
         )
 
@@ -287,7 +377,7 @@ class WidgetSelector:
 
     @classmethod
     def _unwrap_annotation(cls, annotation: Any, default: Any) -> tuple[Any, bool]:
-        """Unwraps Optional/Union annotations, stripping NoneType and non-UI branches like Callable."""
+        """Unwraps Optional/Union annotations, stripping NoneType and preferring scalar UI branches."""
         is_optional = default is None
         origin = get_origin(annotation)
         if origin is types.UnionType or str(origin) == "typing.Union":
@@ -296,16 +386,38 @@ class WidgetSelector:
                 is_optional = True
             non_none_args = [a for a in raw_args if a is not types.NoneType]
             ui_args = [a for a in non_none_args if not cls._is_non_ui_union_branch(a)]
-            candidates = ui_args or non_none_args
+            scalar_args = [a for a in ui_args if cls._is_scalar_ui_branch(a)]
+            candidates = scalar_args or ui_args or non_none_args
             if len(candidates) == 1:
                 annotation = candidates[0]
             elif candidates and all(get_origin(a) is Literal for a in candidates):
                 annotation = candidates[0]
         return annotation, is_optional
 
+    @staticmethod
+    def _coerce_numeric_bounds(raw: Any) -> NumericBounds | None:
+        if isinstance(raw, NumericBounds):
+            return raw
+        if isinstance(raw, tuple) and len(raw) == 3:
+            return NumericBounds(min_val=raw[0], max_val=raw[1], step=raw[2])
+        return None
+
     def introspect(self, target_cls: type[Any], *, exclude: set[str] | None = None) -> list[ParameterSpec]:
         """Introspects and caches `__init__` parameters, walking the MRO when `**kwargs` is forwarded to superclasses."""
-        excluded = frozenset(self.default_exclude | (exclude or set()) | {"self", "args", "kwargs"})
+        cls_excluded: set[str] = set()
+        cls_constraints: dict[str, NumericBounds] = dict(self.numeric_constraints)
+        for base in reversed(target_cls.__mro__):
+            raw_excl = base.__dict__.get("__widget_exclude__")
+            if isinstance(raw_excl, (set, frozenset, list, tuple)):
+                cls_excluded.update(str(x) for x in raw_excl)
+            raw_constr = base.__dict__.get("__widget_constraints__")
+            if isinstance(raw_constr, Mapping):
+                for k, v in raw_constr.items():
+                    coerced = self._coerce_numeric_bounds(v)
+                    if coerced is not None:
+                        cls_constraints[str(k)] = coerced
+
+        excluded = frozenset(self.default_exclude | cls_excluded | (exclude or set()) | {"self", "args", "kwargs"})
         cache_key = (type(self), target_cls, excluded)
         cached = self._INTROSPECT_CACHE.get(cache_key)
         if cached is not None:
@@ -337,6 +449,7 @@ class WidgetSelector:
                         default=param.default,
                         docstring=docs.get(name, ""),
                         is_optional=is_optional,
+                        bounds=cls_constraints.get(name),
                     )
                 )
             if not has_var_keyword:
@@ -418,3 +531,151 @@ class WidgetSelector:
                 kwargs[spec.name] = raw_val
 
         return kwargs
+
+
+class PlotterWidgetSelector(WidgetSelector):
+    """Specialized `WidgetSelector` for plotter classes with color palettes, hex color pickers, and grouped styling."""
+
+    default_exclude: ClassVar[set[str]] = {
+        "y_order",
+        "x_order",
+        "format_",
+        "width",
+        "height",
+        "theme",
+    }
+
+    VEGA_COLOR_SCHEMES: ClassVar[dict[str, str]] = {
+        "tableau10": "Tableau 10 (Categorical)",
+        "category10": "Category 10 (Categorical)",
+        "dark2": "Dark 2 (Categorical)",
+        "set2": "Set 2 (Categorical)",
+        "viridis": "Viridis (Sequential)",
+        "magma": "Magma (Sequential)",
+        "inferno": "Inferno (Sequential)",
+        "plasma": "Plasma (Sequential)",
+        "cividis": "Cividis (Sequential)",
+        "turbo": "Turbo (Sequential)",
+        "blues": "Blues (Sequential)",
+        "tealblues": "Teal-Blues (Sequential)",
+        "greens": "Greens (Sequential)",
+        "oranges": "Oranges (Sequential)",
+        "reds": "Reds (Sequential)",
+        "purples": "Purples (Sequential)",
+        "warmgreys": "Warm Greys (Sequential)",
+        "spectral": "Spectral (Diverging)",
+        "rdylbu": "Red-Yellow-Blue (Diverging)",
+    }
+
+    _STYLING_SUFFIXES: ClassVar[tuple[str, ...]] = (
+        "_width",
+        "_height",
+        "_size",
+        "_color",
+        "_opacity",
+        "_angle",
+        "_padding",
+        "_spacing",
+    )
+    _STYLING_NAMES: ClassVar[set[str]] = {"width", "height", "spacing", "padding", "opacity", "font"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._register_plotter_rules()
+
+    @staticmethod
+    def _is_hex_color_param(spec: ParameterSpec) -> bool:
+        return isinstance(spec.default, str) and spec.default.startswith("#") and len(spec.default) in (4, 7)
+
+    @classmethod
+    def _is_styling_param(cls, spec: ParameterSpec) -> bool:
+        return (
+            spec.name in cls._STYLING_NAMES
+            or spec.name.endswith(cls._STYLING_SUFFIXES)
+            or cls._is_hex_color_param(spec)
+        )
+
+    def _register_plotter_rules(self) -> None:
+        @self.register(lambda s: s.name == "color_scheme")
+        def _build_color_scheme(input_id: str, spec: ParameterSpec) -> TagChild:
+            choices = dict(self.VEGA_COLOR_SCHEMES)
+            default_scheme = str(spec.default) if spec.default else "tableau10"
+            if default_scheme not in choices:
+                choices[default_scheme] = default_scheme.title()
+            return shiny_ui.input_select(
+                input_id,
+                label=self._create_label(spec),
+                choices=choices,
+                selected=default_scheme,
+            )
+
+        @self.register(self._is_hex_color_param)
+        def _build_hex_color(input_id: str, spec: ParameterSpec) -> TagChild:
+            default_hex = (
+                str(spec.default) if isinstance(spec.default, str) and spec.default.startswith("#") else "#4c78a8"
+            )
+            sync_js = (
+                "const t=this.parentElement.querySelector('input[type=text]');"
+                "if(t){t.value=this.value;t.dispatchEvent(new Event('input',{bubbles:true}));"
+                "t.dispatchEvent(new Event('change',{bubbles:true}));}"
+            )
+            return shiny_ui.div(
+                shiny_ui.tags.label(self._create_label(spec), class_="form-label mb-1"),
+                shiny_ui.div(
+                    shiny_ui.tags.input(
+                        type="color",
+                        value=default_hex,
+                        oninput=sync_js,
+                        class_="form-control form-control-color me-2",
+                        style="width: 2.5rem; min-width: 2.5rem; padding: 0.2rem;",
+                        title="Pick color",
+                    ),
+                    shiny_ui.div(
+                        shiny_ui.input_text(input_id, label=None, value=default_hex),
+                        class_="flex-grow-1",
+                    ),
+                    class_="d-flex align-items-center",
+                ),
+                class_="mb-3",
+            )
+
+    def build_form(
+        self,
+        target_cls: type[Any],
+        *,
+        exclude: set[str] | None = None,
+        choices: Mapping[str, Sequence[str] | Mapping[str, str]] | None = None,
+        prefix: str = "",
+        group_styling: bool = True,
+    ) -> list[TagChild]:
+        """Builds Plotter input widgets, grouping low-level styling & dimension controls into a collapsible accordion."""
+        specs = self.introspect(target_cls, exclude=exclude)
+        if not group_styling:
+            return [self._build_single_widget(spec, choices=choices, prefix=prefix) for spec in specs]
+
+        primary_widgets: list[TagChild] = []
+        styling_widgets: list[TagChild] = []
+
+        for spec in specs:
+            w = self._build_single_widget(spec, choices=choices, prefix=prefix)
+            if self._is_styling_param(spec):
+                styling_widgets.append(w)
+            else:
+                primary_widgets.append(w)
+
+        if styling_widgets:
+            accordion_id = f"{prefix}styling_accordion" if prefix else "plotter_styling_accordion"
+            primary_widgets.append(
+                shiny_ui.accordion(
+                    shiny_ui.accordion_panel(
+                        "Styling & Dimensions",
+                        *styling_widgets,
+                        value="styling_panel",
+                    ),
+                    id=accordion_id,
+                    open=False,
+                    class_="mt-2",
+                )
+            )
+
+        return primary_widgets

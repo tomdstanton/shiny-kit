@@ -4,11 +4,12 @@ import inspect
 from abc import ABC
 from collections.abc import Callable, Sized
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, ClassVar, Literal, Self, overload
 
 import shiny.ui as shiny_ui
-from htmltools import Tag
-from shiny import Session, reactive
+from htmltools import Tag, TagChild
+from shiny import Inputs, Outputs, Session, reactive, render
 from shiny.session import get_current_session
 
 from shiny_kit.caching import BaseCache, default_cache
@@ -194,24 +195,32 @@ class ArtifactRegistry[T]:
         self._active_key.set(None)
         self._version.set(ver_now + 1)
 
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _inspect_hook_signature(
+        fn: Callable[..., Any],
+    ) -> tuple[frozenset[str], bool, int, bool]:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        pos_count = sum(
+            1 for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+        has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        return frozenset(sig.parameters.keys()), has_var_kw, pos_count, has_var_pos
+
     def _invoke_state_hook(self, hook: Callable[..., Any] | str | None, *args: Any, **kwargs: Any) -> Any:
         """Invokes a state hook (method name or callable), forwarding only accepted keyword arguments."""
         if hook is None or self._owner_state is None:
             return None
         fn: Callable[..., Any] = getattr(self._owner_state, hook) if isinstance(hook, str) else hook
-        sig = inspect.signature(fn)
-        params = list(sig.parameters.values())
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-        filtered_kwargs = kwargs if has_var_kw else {k: v for k, v in kwargs.items() if k in sig.parameters}
+        target = getattr(fn, "__func__", fn)
+        param_names, has_var_kw, pos_count, has_var_pos = self._inspect_hook_signature(target)
+        filtered_kwargs = kwargs if has_var_kw else {k: v for k, v in kwargs.items() if k in param_names}
 
         if isinstance(hook, str) or getattr(fn, "__self__", None) is not None:
-            pos_params = [
-                p
-                for p in params
-                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
-            eff_args = args if has_var_pos else args[: len(pos_params)]
+            adj_pos = max(pos_count - (1 if getattr(fn, "__func__", None) is not None else 0), 0)
+            eff_args = args if has_var_pos else args[:adj_pos]
             return fn(*eff_args, **filtered_kwargs)
         return fn(self._owner_state, *args, **filtered_kwargs)
 
@@ -417,7 +426,7 @@ class BaseSessionState(ABC):  # noqa: B024
             if msg:
                 return msg
         for reg in self.registries.values():
-            if reg._toast is not None and res in reg.items.values():
+            if reg._toast is not None and any(res is v for v in reg.items.values()):
                 return reg.format_toast(res)
         return ""
 
@@ -458,3 +467,49 @@ class BaseSessionState(ABC):  # noqa: B024
         sess = self.root_session or get_current_session()
         if sess is not None:
             shiny_ui.update_navset(target_navset, selected=tab_id, session=sess)
+
+    @classmethod
+    def navbar_controls(
+        cls,
+        *,
+        color_mode_id: str = "color_mode",
+        badges_id: str = "navbar_registry_badges",
+        default_mode: Literal["light", "dark"] = "light",
+    ) -> tuple[Any, ...]:
+        """Returns `(nav_spacer(), nav_control(output_ui(badges_id)), nav_control(input_dark_mode(...)))` items."""
+        return (
+            shiny_ui.nav_spacer(),
+            shiny_ui.nav_control(
+                shiny_ui.output_ui(badges_id),
+            ),
+            shiny_ui.nav_control(
+                shiny_ui.div(
+                    shiny_ui.input_dark_mode(id=color_mode_id, mode=default_mode),
+                    class_="d-flex align-items-center ps-1 pe-2",
+                ),
+            ),
+        )
+
+    def bind_navbar(
+        self,
+        input: Inputs,
+        output: Outputs,
+        *,
+        color_mode_id: str = "color_mode",
+        badges_id: str = "navbar_registry_badges",
+    ) -> None:
+        """Binds top-level navbar dark-mode synchronization and reactive registry status badges."""
+
+        @reactive.effect
+        def _sync_color_mode() -> None:
+            try:
+                mode_val = input[color_mode_id]()
+            except Exception:
+                mode_val = "light"
+            self.color_mode = "dark" if mode_val == "dark" else "light"
+
+        @render.ui
+        def _render_badges() -> TagChild:
+            return self.render_navbar_badges()
+
+        output(id=badges_id)(_render_badges)
